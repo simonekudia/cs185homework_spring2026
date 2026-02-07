@@ -20,7 +20,7 @@ from hw1_imitation.data import (
     load_pusht_zarr,
 )
 from hw1_imitation.model import build_policy, PolicyType
-from hw1_imitation.evaluation import Logger
+from hw1_imitation.evaluation import Logger, evaluate_policy
 
 LOGDIR_PREFIX = "exp"
 
@@ -42,7 +42,7 @@ class TrainConfig:
     weight_decay: float = 0.0
     hidden_dims: tuple[int, ...] = (256, 256, 256)
     # The number of epochs to train for.
-    num_epochs: int = 400
+    num_epochs: int = 600
     # How often to run evaluation, measured in training steps.
     eval_interval: int = 10_000
     num_video_episodes: int = 5
@@ -128,6 +128,36 @@ def run_training(config: TrainConfig) -> None:
     logger = Logger(log_dir)
 
     ### TODO: PUT YOUR MAIN TRAINING LOOP HERE ###
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay) #optimizer
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.num_epochs*len(loader))
+    # training loop:
+    global_step = 0
+    model.train()
+    for epoch in range(config.num_epochs):
+        for states_batch, actions_batch in loader:
+            states, actions = states_batch.to(device), actions_batch.to(device)
+            optimizer.zero_grad()
+            # sample_action_chunk = model.sample_actions(state)
+            loss = model.compute_loss(states, actions)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            global_step += 1
+            if global_step % config.eval_interval == 0:
+                evaluate_policy(
+                    model=model,
+                    normalizer=normalizer, 
+                    device=device, 
+                    chunk_size=config.chunk_size, 
+                    video_size=config.video_size, 
+                    num_video_episodes=config.num_video_episodes,
+                    flow_num_steps=config.flow_num_steps,
+                    logger=logger,
+                    step=global_step
+                )
+            
+
 
     logger.dump_for_grading()
 
