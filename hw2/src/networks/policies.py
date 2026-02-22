@@ -60,9 +60,9 @@ class MLPPolicy(nn.Module):
     def get_action(self, obs: np.ndarray) -> np.ndarray:
         """Takes a single observation (as a numpy array) and returns a single action (as a numpy array)."""
         # TODO: implement get_action
-        action = self.forward(ptu.from_numpy(obs[None, :])).sample()
+        action = self.forward(ptu.from_numpy(obs)).sample()
 
-        return ptu.to_numpy(action[0])
+        return ptu.to_numpy(action)
 
     def forward(self, obs: torch.FloatTensor):
         """
@@ -106,7 +106,7 @@ class MLPPolicyPG(MLPPolicy):
         advantages = ptu.from_numpy(advantages)
 
         # TODO: compute the policy gradient actor loss
-        loss = -self.forward(obs).log_prob(actions) * advantages
+        loss = -(self.forward(obs).log_prob(actions)).sum(axis=1) * advantages
         loss = loss.mean()
 
         # TODO: perform an optimizer step
