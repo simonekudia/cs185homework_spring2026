@@ -1,0 +1,30 @@
+=== Sun May 10 -------- PDT 2026 ===
+file     = llm_rl_final_proj_public_submission/policy_generations/grpo_gopo.jsonl
+win_rate = 0.6889
+threshold= 0.7000
+usable   = 45
+status   = FAIL
+=== Sun May 10 -------- PDT 2026 ===
+file     = llm_rl_final_proj_public_submission/policy_generations/gspo_gopo.jsonl
+win_rate = 0.7750
+threshold= 0.7000
+usable   = 40
+status   = PASS
+=== Mon May 11 01:21:10 PDT 2026 ===
+file     = llm_rl_final_proj_public_submission/policy_generations/gspo_gopo_rm100_rm445_ensemble_min.jsonl
+win_rate = 0.7000
+threshold= 0.7000
+usable   = 50
+status   = PASS
+=== Mon May 11 01:34:11 PDT 2026 ===
+file     = llm_rl_final_proj_public_submission/policy_generations/gspo_gopo_rm100_rm445_ensemble_pess.jsonl
+win_rate = 0.6923
+threshold= 0.7000
+usable   = 52
+status   = FAIL
+=== Mon May 11 01:46:49 PDT 2026 ===
+file     = llm_rl_final_proj_public_submission/policy_generations/gspo_gopo_rm100_rm445_ensemble_mean_v1.jsonl
+win_rate = 0.8148
+threshold= 0.7000
+usable   = 54
+status   = PASS

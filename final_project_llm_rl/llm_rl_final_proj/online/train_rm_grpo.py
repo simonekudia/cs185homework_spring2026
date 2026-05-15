@@ -13,6 +13,8 @@ import torch
 
 from llm_rl_final_proj.data.ultrafeedback import GenerationExample, build_generation_examples, dataset_overview
 from llm_rl_final_proj.models.load import (
+    PolicyModel,
+    RewardModel,
     load_lora_policy_model_and_tokenizer,
     load_reward_model_and_tokenizer,
 )
@@ -42,6 +44,8 @@ class OnlineRMGRPOConfig:
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
     reward_model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
     reward_adapter_path: str = ""
+    reward_adapter_paths: str = ""  # reward model ensemble adapter paths, comma-separated
+    ensemble_aggregation: str = "min" # reward model ensemble aggregation method: "min", "mean", or "pessimistic"
     dataset_name: str = "HuggingFaceH4/ultrafeedback_binarized"
     train_split: str = "train_gen"
     eval_split: str = "test_gen"
@@ -75,7 +79,7 @@ class OnlineRMGRPOConfig:
     adv_clip: float = 5.0
 
     max_prompt_tokens: int = 700
-    max_response_tokens: int = 256
+    max_response_tokens: int = 512
     train_limit: int = 0
     eval_limit: int = 64
     reward_batch_size: int = 16
@@ -99,6 +103,10 @@ class OnlineRMGRPOConfig:
     wandb_enabled: bool = True
     sample_log_n: int = 8
     sample_log_max_chars: int = 2500
+    use_remax: bool = False
+
+
+    advantage_type: str = "group_mean" # method for computing advantages: "group_mean", or "rank"
 
 
 def parse_args() -> OnlineRMGRPOConfig:
@@ -112,6 +120,11 @@ def parse_args() -> OnlineRMGRPOConfig:
     ap.add_argument("--model_name", type=str, default=OnlineRMGRPOConfig.model_name)
     ap.add_argument("--reward_model_name", type=str, default=OnlineRMGRPOConfig.reward_model_name)
     ap.add_argument("--reward_adapter_path", type=str, required=True)
+    ap.add_argument("--reward_adapter_paths", type=str, default="",
+                help="Comma-separated additional RM adapter paths for ensemble. "
+                     "E.g. /vol/rm/step_000100/adapter,/vol/rm/step_000200/adapter")
+    ap.add_argument("--ensemble_aggregation", type=str, default="min",
+                choices=["min", "mean", "pessimistic"])
     ap.add_argument("--dataset_name", type=str, default=OnlineRMGRPOConfig.dataset_name)
     ap.add_argument("--train_split", type=str, default=OnlineRMGRPOConfig.train_split)
     ap.add_argument("--eval_split", type=str, default=OnlineRMGRPOConfig.eval_split)
@@ -167,6 +180,8 @@ def parse_args() -> OnlineRMGRPOConfig:
         action=argparse.BooleanOptionalAction,
         default=OnlineRMGRPOConfig.grad_checkpointing,
     )
+    ap.add_argument("--use_remax", action=argparse.BooleanOptionalAction, default=OnlineRMGRPOConfig.use_remax)
+
 
     ap.add_argument("--wandb_project", type=str, default=OnlineRMGRPOConfig.wandb_project)
     ap.add_argument("--wandb_name", type=str, default=OnlineRMGRPOConfig.wandb_name)
@@ -177,9 +192,16 @@ def parse_args() -> OnlineRMGRPOConfig:
     )
     ap.add_argument("--sample_log_n", type=int, default=OnlineRMGRPOConfig.sample_log_n)
     ap.add_argument("--sample_log_max_chars", type=int, default=OnlineRMGRPOConfig.sample_log_max_chars)
+
+    ap.add_argument("--advantage_type", type=str, 
+                default=OnlineRMGRPOConfig.advantage_type,
+                choices=["group_mean", "rank"])
+    
     args = ap.parse_args()
     return OnlineRMGRPOConfig(**vars(args))
 
+def _parse_adapter_paths(raw: str) -> list[str]:
+    return [p.strip() for p in raw.split(",") if p.strip()]
 
 def maybe_update_warmup_lr(optimizer: torch.optim.Optimizer, base_lr: float, step: int, warmup_steps: int) -> None:
     if warmup_steps <= 0:
@@ -205,13 +227,40 @@ def _compute_group_advantages(
     group_size: int,
     eps: float = 1e-6,
     *,
+    greedy_rewards: torch.Tensor | None = None,
     divide_by_std: bool,
 ) -> torch.Tensor:
-    del eps
     # TODO(student): compute one scalar advantage per sampled completion by grouping rewards
     # into prompt-wise batches of size `group_size`, subtracting the group mean, and optionally
     # dividing by the group standard deviation when `divide_by_std=True`.
-    raise NotImplementedError("Implement _compute_group_advantages in the student starter.")
+    N = rewards.shape[0]
+    grouped = rewards.view(-1, group_size)
+    if greedy_rewards is not None:
+        baseline = greedy_rewards.unsqueeze(1)
+    else:
+        baseline = grouped.mean(dim=1, keepdim=True)
+    advantages = grouped - baseline
+    if divide_by_std:
+        std = grouped.std(dim=1, keepdim=True, unbiased=False)
+        advantages = advantages / (std + eps)
+    return advantages.view(N)
+
+def _compute_group_advantages_rank(
+        rewards: torch.Tensor,
+        group_size: int,
+) -> torch.Tensor:
+    N = rewards.shape[0]
+    grouped = rewards.view(-1, group_size) # reshape into [B, group_size]
+
+    rank_values = torch.arange(group_size, device=rewards.device).float()
+    rank_values = rank_values - (group_size - 1) / 2.0  # center at zero
+
+    sorted_indices = torch.argsort(grouped, dim=1)
+
+    ranks = torch.zeros_like(grouped, dtype=torch.float)
+    ranks.scatter_(1, sorted_indices, rank_values.unsqueeze(0).expand_as(grouped))
+
+    return ranks.view(N)
 
 
 def _build_online_algo(cfg: OnlineRMGRPOConfig):
@@ -237,7 +286,7 @@ def _build_online_algo(cfg: OnlineRMGRPOConfig):
 def _algo_divides_advantages_by_std(algo: str) -> bool:
     # TODO(student): return True for the algorithms that use group-standard-deviation
     # normalization and False for the algorithms that intentionally avoid it.
-    raise NotImplementedError("Implement _algo_divides_advantages_by_std in the student starter.")
+    return algo in ("grpo", "gspo")
 
 
 def _normalize_completion_for_reward_scoring(text: str) -> str:
@@ -298,9 +347,9 @@ def save_checkpoint(model: torch.nn.Module, cfg: OnlineRMGRPOConfig, step: int) 
 @torch.no_grad()
 def evaluate_policy_with_reward_model(
     *,
-    policy_model: torch.nn.Module,
+    policy_model: PolicyModel,
     policy_tokenizer,
-    reward_model: torch.nn.Module,
+    reward_model: RewardModel,
     reward_tokenizer,
     examples: Sequence[GenerationExample],
     device: torch.device,
@@ -375,6 +424,25 @@ def evaluate_policy_with_reward_model(
         metrics["eval/rm_margin_policy_minus_reference_mean"] = float(margin.mean().item())
     return metrics, rows, rm_scores
 
+def _aggregate_ensemble_rewards(
+    reward_scores_list: list[list[float]],
+    method: str
+) -> list[float]:
+    
+    stacked = torch.tensor(reward_scores_list, dtype=torch.float32)
+
+    if method == "min":
+        result = stacked.min(dim=0).values
+    elif method == "mean":
+        result = stacked.mean(dim=0)
+    elif method == "pessimistic":
+        mean = stacked.mean(dim=0)
+        std = stacked.std(dim=0, unbiased=False)
+        result = mean - std
+    else:
+        raise ValueError(f"Unknown aggregation: {method}")
+    
+    return result.tolist()
 
 def main() -> None:
     cfg = parse_args()
@@ -442,6 +510,20 @@ def main() -> None:
     reward_model.eval()
     for p in reward_model.parameters():
         p.requires_grad_(False)
+    
+    ensemble_reward_models = []
+    for p in _parse_adapter_paths(cfg.reward_adapter_paths):
+        loaded = load_reward_model_and_tokenizer(
+            cfg.reward_model_name,
+            device=device,
+            dtype=dtype,
+            adapter_path=p,
+        )
+        loaded.model.eval()
+        for param in loaded.model.parameters():
+            param.requires_grad_(False)
+            
+        ensemble_reward_models.append((loaded.model, loaded.tokenizer))
 
     optimizer = torch.optim.AdamW(
         [p for p in policy_model.parameters() if p.requires_grad],
@@ -535,7 +617,6 @@ def main() -> None:
             max_prompt_tokens=cfg.max_prompt_tokens,
             output_to_cpu=False,
         )
-
         reward_rows = []
         for i, completion_text in enumerate(rollout.completion_texts):
             meta = rollout.task_metas[i]
@@ -547,7 +628,7 @@ def main() -> None:
                     "response_text": _normalize_completion_for_reward_scoring(completion_text),
                 }
             )
-        reward_scores = score_prompt_response_pairs(
+        all_scores = [score_prompt_response_pairs(
             reward_model,
             reward_tokenizer,
             reward_rows,
@@ -555,13 +636,84 @@ def main() -> None:
             max_response_tokens=cfg.max_response_tokens,
             per_device_batch_size=cfg.reward_batch_size,
             device=device,
-        )
+        )]
+
+        for ensemble_model, ensemble_tokenizer in ensemble_reward_models:
+            all_scores.append(score_prompt_response_pairs(
+                ensemble_model,
+                ensemble_tokenizer,
+                reward_rows,
+                max_prompt_tokens=cfg.max_prompt_tokens,
+                max_response_tokens=cfg.max_response_tokens,
+                per_device_batch_size=cfg.reward_batch_size,
+                device=device,
+            ))
+
+        if len(all_scores) > 1:
+            reward_scores = _aggregate_ensemble_rewards(all_scores, method=cfg.ensemble_aggregation)
+        else:
+            reward_scores = all_scores[0]
+
         rewards = torch.tensor(reward_scores, device=device, dtype=torch.float32)
-        advantages = _compute_group_advantages(
-            rewards,
-            cfg.group_size,
-            divide_by_std=_algo_divides_advantages_by_std(cfg.algo),
-        )
+        greedy_rewards = None
+        if cfg.use_remax:
+            greedy_sampling_cfg = SamplingConfig(
+                min_new_tokens=cfg.min_new_tokens,
+                max_new_tokens=cfg.max_new_tokens,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                repetition_penalty=cfg.repetition_penalty,
+                do_sample=False,
+            )
+            greedy_rollout = sampler.rollout(
+                policy_model=policy_model,
+                prompt_messages=[ex.prompt_messages for ex in prompt_batch],
+                task_names=["synthetic_instruction_following"] * len(prompt_batch),
+                task_metas=[
+                    {
+                        "row_id": ex.row_id,
+                        "prompt_text": ex.prompt_text,
+                        "reference_response_text": ex.reference_response_text,
+                    }
+                    for ex in prompt_batch
+                ],
+                group_size=1,
+                sampling=greedy_sampling_cfg,
+                max_prompt_tokens=cfg.max_prompt_tokens,
+                output_to_cpu=False,
+            )
+            greedy_reward_rows = []
+            for i, completion_text in enumerate(greedy_rollout.completion_texts):
+                meta = greedy_rollout.task_metas[i]
+                greedy_reward_rows.append(
+                    {
+                        "row_id": f"{meta.get('row_id', i)}:greedy",
+                        "prompt_messages": greedy_rollout.prompt_messages[i],
+                        "prompt_text": str(meta.get("prompt_text", "")),
+                        "response_text": _normalize_completion_for_reward_scoring(completion_text),
+                    }
+                )
+            greedy_scores = score_prompt_response_pairs(
+                reward_model,
+                reward_tokenizer,
+                greedy_reward_rows,
+                max_prompt_tokens=cfg.max_prompt_tokens,
+                max_response_tokens=cfg.max_response_tokens,
+                per_device_batch_size=cfg.reward_batch_size,
+                device=device,
+            )
+            greedy_rewards = torch.tensor(greedy_scores, device=device, dtype=torch.float32)
+
+        if cfg.advantage_type == "rank":
+            advantages = _compute_group_advantages_rank(rewards, cfg.group_size)
+        else:
+            advantages = _compute_group_advantages(
+                rewards,
+                cfg.group_size,
+                divide_by_std=_algo_divides_advantages_by_std(cfg.algo),
+                greedy_rewards=greedy_rewards,
+            )
         batch = RolloutBatch(
             input_ids=rollout.input_ids,
             attention_mask=rollout.attention_mask,
@@ -585,6 +737,7 @@ def main() -> None:
             "rollout/reward_model_score_std": float(rewards.std(unbiased=False).item()),
             "rollout/reward_model_score_min": float(rewards.min().item()),
             "rollout/reward_model_score_max": float(rewards.max().item()),
+            "rollout/ensemble_num_models": float(len(all_scores)),
             "rollout/advantage_mean": float(advantages.mean().item()),
             "rollout/advantage_std": float(advantages.std(unbiased=False).item()),
             "rollout/completion_mean_tokens": float(completion_lengths.mean().item()),
@@ -595,6 +748,12 @@ def main() -> None:
             **train_metrics,
             **get_cuda_memory_metrics(prefix="train"),
         }
+
+        if len(all_scores) > 1:
+            stacked = torch.tensor(all_scores, dtype=torch.float32)
+            log_metrics["rollout/ensemble_disagreement_std_mean"] = float(
+                stacked.std(dim=0, unbiased=False).mean().item()
+            )
         logger.log(log_metrics, step=step)
 
         should_eval = (step % cfg.eval_interval == 0) or (step == cfg.steps)

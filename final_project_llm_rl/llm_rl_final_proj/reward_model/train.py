@@ -53,8 +53,8 @@ class RewardModelConfig:
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
 
-    max_prompt_tokens: int = 512
-    max_response_tokens: int = 256
+    max_prompt_tokens: int = 700
+    max_response_tokens: int = 512
 
     train_limit: int = 0
     eval_limit: int = 512
@@ -161,15 +161,15 @@ def _compute_pair_metrics(chosen_scores: torch.Tensor, rejected_scores: torch.Te
     #   1. the per-example margin,
     #   2. the mean negative log-sigmoid loss,
     #   3. summary metrics such as pair accuracy and mean margin.
-    margins = torch.empty_like(chosen_scores)
-    loss = torch.empty((), device=chosen_scores.device, dtype=chosen_scores.dtype)
+    margins = chosen_scores - rejected_scores
+    loss = -F.logsigmoid(margins).mean()
     return {
         "loss_tensor": loss,
-        "reward_model/loss": float(loss.detach().item()),
-        "reward_model/pair_accuracy": float((margins.detach() > 0).float().mean().item()),
-        "reward_model/margin_mean": float(margins.detach().mean().item()),
-        "reward_model/chosen_score_mean": float(chosen_scores.detach().mean().item()),
-        "reward_model/rejected_score_mean": float(rejected_scores.detach().mean().item()),
+        "reward_model/loss": float(loss.mean().item()),
+        "reward_model/pair_accuracy": float((margins > 0).float().mean().item()),
+        "reward_model/margin_mean": float(margins.mean().item()),
+        "reward_model/chosen_score_mean": float(chosen_scores.mean().item()),
+        "reward_model/rejected_score_mean": float(rejected_scores.mean().item()),
     }
 
 

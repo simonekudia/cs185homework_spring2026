@@ -9,7 +9,9 @@ description = "CS 285/185 LLM RL default final project"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+  "matplotlib>=3.10.9",
   "modal>=1.0.0",
+  "pandas>=3.0.1",
 ]
 
 [project.optional-dependencies]
